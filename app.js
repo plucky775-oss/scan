@@ -46,6 +46,14 @@ const elements = {
   autoCropBtn: $('#autoCropBtn'),
   resetCropBtn: $('#resetCropBtn'),
   applyCropBtn: $('#applyCropBtn'),
+  previewDialog: $('#previewDialog'),
+  previewCanvas: $('#previewCanvas'),
+  previewTitle: $('#previewTitle'),
+  previewMeta: $('#previewMeta'),
+  previewFilter: $('#previewFilter'),
+  previewCrop: $('#previewCrop'),
+  previewHint: $('#previewHint'),
+  previewCloseBtn: $('#previewCloseBtn'),
   toast: $('#toast'),
 };
 
@@ -55,8 +63,22 @@ const FILTERS = [
   { id: 'bw', label: '흑백' },
   { id: 'bright', label: '밝게' },
   { id: 'contrast', label: '대비' },
-  { id: 'dewrinkle', label: '구김완화' },
+  { id: 'shadow', label: '그림자 완화' },
 ];
+
+const FILTER_HELP = {
+  original: '원본 그대로 표시합니다.',
+  sharp: '글자와 선을 조금 더 선명하게 보정합니다.',
+  bw: '색을 제거하고 글자를 진하게 표현합니다. 밝기 조절로 배경 날림을 줄일 수 있습니다.',
+  bright: '어두운 사진을 전체적으로 밝게 만듭니다.',
+  contrast: '글자와 배경의 대비를 강하게 만듭니다.',
+  shadow: '구김 자체를 펴는 기능이 아니라, 접힘·그림자·얼룩처럼 어두운 부분을 완화하는 보정입니다.',
+  dewrinkle: '구김 자체를 펴는 기능이 아니라, 접힘·그림자·얼룩처럼 어두운 부분을 완화하는 보정입니다.',
+};
+
+function filterLabel(filterId) {
+  return FILTERS.find((filter) => filter.id === filterId)?.label || '원본';
+}
 
 const QUALITY = {
   high: { maxWidth: 1800, jpeg: 0.92, label: '고화질' },
@@ -482,6 +504,7 @@ async function addFiles(files) {
       width: img.naturalWidth,
       height: img.naturalHeight,
       filter: 'sharp',
+      bwBrightness: 92,
       rotation: 0,
       crop: suggestedCrop,
     });
@@ -504,9 +527,25 @@ function renderPages() {
       <button class="filter-pill ${page.filter === filter.id ? 'is-active' : ''}" data-action="filter" data-id="${page.id}" data-filter="${filter.id}">${filter.label}</button>
     `).join('');
 
+    const cropStatus = page.crop?.type === 'quad' ? '문서영역 지정됨' : '전체 이미지';
+    const bwValue = Math.max(70, Math.min(115, Number(page.bwBrightness || 92)));
+    const bwControl = page.filter === 'bw' ? `
+      <div class="adjust-card">
+        <div class="adjust-card__head">
+          <strong>흑백 밝기</strong>
+          <span>${bwValue}%</span>
+        </div>
+        <input class="range-input" type="range" min="70" max="115" value="${bwValue}" data-action="bw-brightness" data-id="${page.id}" />
+        <small>배경이 너무 하얗게 날아가면 왼쪽으로 낮추세요.</small>
+      </div>
+    ` : '';
+
     return `
       <article class="page-card" data-page-id="${page.id}">
-        <canvas class="page-thumb" data-thumb-id="${page.id}" width="232" height="312"></canvas>
+        <button class="thumb-button" data-action="preview" data-id="${page.id}" aria-label="${index + 1}페이지 현재 상태 보기">
+          <canvas class="page-thumb" data-thumb-id="${page.id}" width="232" height="312"></canvas>
+          <span class="thumb-button__label">상태 보기</span>
+        </button>
         <div class="page-info">
           <div class="page-info__head">
             <div>
@@ -515,7 +554,13 @@ function renderPages() {
             </div>
             <button class="icon-btn danger-lite" data-action="delete" data-id="${page.id}">삭제</button>
           </div>
+          <div class="page-status">
+            <span>보정: ${filterLabel(page.filter)}</span>
+            <span>회전: ${page.rotation || 0}°</span>
+            <span>${cropStatus}</span>
+          </div>
           <div class="filter-row">${filterButtons}</div>
+          ${bwControl}
           <div class="action-grid">
             <button class="icon-btn" data-action="rotate" data-id="${page.id}">회전</button>
             <button class="icon-btn" data-action="crop" data-id="${page.id}">자르기/펼치기</button>
@@ -581,10 +626,10 @@ async function renderPageToCanvas(page, options = {}) {
   const processed = rotateAndFilterCanvas(baseCanvas, page.rotation, page.filter);
 
   if (page.filter === 'bw') {
-    applyBlackWhite(processed);
+    applyBlackWhite(processed, page.bwBrightness || 92);
   } else if (page.filter === 'sharp') {
     applyMildSharpen(processed);
-  } else if (page.filter === 'dewrinkle') {
+  } else if (page.filter === 'shadow' || page.filter === 'dewrinkle') {
     applyDocumentClean(processed);
     applyMildSharpen(processed);
   }
@@ -708,8 +753,9 @@ function filterToCanvasFilter(filter) {
     case 'sharp': return 'brightness(1.05) contrast(1.22) saturate(0.95)';
     case 'bright': return 'brightness(1.18) contrast(1.05)';
     case 'contrast': return 'brightness(1.02) contrast(1.38)';
-    case 'bw': return 'grayscale(1) contrast(1.06) brightness(1.04)';
-    case 'dewrinkle': return 'grayscale(.10) brightness(1.10) contrast(1.12) saturate(.88)';
+    case 'bw': return 'grayscale(1) contrast(1.03) brightness(0.98)';
+    case 'shadow':
+    case 'dewrinkle': return 'grayscale(.08) brightness(1.03) contrast(1.10) saturate(.88)';
     default: return 'none';
   }
 }
@@ -750,7 +796,7 @@ function boxBlurGray(gray, width, height, radius) {
   return out;
 }
 
-function applyBlackWhite(canvas) {
+function applyBlackWhite(canvas, brightnessPercent = 92) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = imageData.data;
@@ -772,14 +818,16 @@ function applyBlackWhite(canvas) {
     let value;
 
     if (corrected < localThreshold) {
-      value = Math.max(0, corrected * 0.44);
-    } else if (corrected > 202) {
-      value = 255;
+      value = Math.max(0, corrected * 0.48);
+    } else if (corrected > 214) {
+      value = 246;
     } else {
-      const t = (corrected - localThreshold) / Math.max(1, 202 - localThreshold);
-      value = 210 + t * 45;
+      const t = (corrected - localThreshold) / Math.max(1, 214 - localThreshold);
+      value = 198 + t * 48;
     }
 
+    const brightness = Math.max(0.70, Math.min(1.15, Number(brightnessPercent) / 100));
+    value = value * brightness;
     data[i] = data[i + 1] = data[i + 2] = Math.max(0, Math.min(255, value));
   }
   ctx.putImageData(imageData, 0, 0);
@@ -850,6 +898,39 @@ function applyMildSharpen(canvas) {
 
 function pageById(id) {
   return state.pages.find((page) => page.id === id);
+}
+
+function cropSummary(page) {
+  if (page.crop?.type !== 'quad' || !Array.isArray(page.crop.points)) return '전체 이미지 사용';
+  const xs = page.crop.points.map((point) => point.x);
+  const ys = page.crop.points.map((point) => point.y);
+  const widthRatio = Math.max(...xs) - Math.min(...xs);
+  const heightRatio = Math.max(...ys) - Math.min(...ys);
+  return `문서 영역 ${Math.round(widthRatio)}% × ${Math.round(heightRatio)}%`;
+}
+
+async function openPagePreview(page) {
+  if (!page) return;
+  elements.previewDialog.showModal();
+  elements.previewTitle.textContent = `${state.pages.findIndex((item) => item.id === page.id) + 1}페이지 현재 상태`;
+  elements.previewMeta.textContent = `${page.width}×${page.height}px · ${formatBytes(page.size)} · 회전 ${page.rotation || 0}°`;
+  elements.previewFilter.textContent = `보정: ${filterLabel(page.filter)}`;
+  elements.previewCrop.textContent = cropSummary(page);
+  elements.previewHint.textContent = FILTER_HELP[page.filter] || '';
+
+  const canvas = elements.previewCanvas;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#f4f8ff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const rendered = await renderPageToCanvas(page, { maxWidth: 1100 });
+  const maxWidth = Math.min(720, window.innerWidth - 62);
+  const maxHeight = Math.min(660, Math.max(320, window.innerHeight * 0.58));
+  const scale = Math.min(maxWidth / rendered.width, maxHeight / rendered.height, 1);
+  canvas.width = Math.max(1, Math.round(rendered.width * scale));
+  canvas.height = Math.max(1, Math.round(rendered.height * scale));
+  canvas.getContext('2d').drawImage(rendered, 0, 0, canvas.width, canvas.height);
 }
 
 function selectedQuality() {
@@ -1243,6 +1324,11 @@ function bindEvents() {
     const page = state.pages[index];
     if (!page) return;
 
+    if (action === 'preview') {
+      openPagePreview(page);
+      return;
+    }
+
     if (action === 'filter') page.filter = button.dataset.filter;
     if (action === 'rotate') page.rotation = (page.rotation + 90) % 360;
     if (action === 'delete') state.pages.splice(index, 1);
@@ -1257,6 +1343,19 @@ function bindEvents() {
     elements.pdfResult.hidden = true;
     renderPages();
   });
+
+  elements.pageList.addEventListener('input', (event) => {
+    const input = event.target.closest('input[data-action="bw-brightness"]');
+    if (!input) return;
+    const page = pageById(input.dataset.id);
+    if (!page) return;
+    page.bwBrightness = Number(input.value);
+    state.currentPdf = null;
+    elements.pdfResult.hidden = true;
+    renderPages();
+  });
+
+  elements.previewCloseBtn.addEventListener('click', () => elements.previewDialog.close());
 
   elements.makePdfBtn.addEventListener('click', makePdf);
   elements.clearPagesBtn.addEventListener('click', () => {

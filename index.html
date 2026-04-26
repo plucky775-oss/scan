@@ -179,6 +179,30 @@
     </form>
   </dialog>
 
+
+  <dialog id="previewDialog" class="preview-dialog">
+    <div class="preview-dialog__inner">
+      <div class="section-title">
+        <div>
+          <p class="eyebrow">Current Preview</p>
+          <h2 id="previewTitle">현재 상태</h2>
+        </div>
+        <button id="previewCloseBtn" class="ghost small" type="button">닫기</button>
+      </div>
+
+      <div class="preview-meta-box">
+        <span id="previewMeta">-</span>
+        <span id="previewFilter">보정: -</span>
+        <span id="previewCrop">문서 영역: -</span>
+      </div>
+      <p id="previewHint" class="preview-hint"></p>
+
+      <div class="preview-canvas-wrap">
+        <canvas id="previewCanvas" aria-label="현재 보정 상태 미리보기"></canvas>
+      </div>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>
