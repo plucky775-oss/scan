@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f2f5f" />
+  <meta name="description" content="촬영한 문서를 보기 좋게 보정하고 PDF로 저장·공유하는 PWA 스캐너 앱" />
+  <title>스마트 문서 스캐너</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div class="hero__top">
+        <div>
+          <p class="eyebrow">PWA Document Scanner</p>
+          <h1>스마트 문서 스캐너</h1>
+          <p class="hero__desc">문서를 촬영하고, 보정하고, 여러 장을 하나의 PDF로 저장하세요.</p>
+        </div>
+        <button id="installBtn" class="ghost small" hidden>홈 화면 추가</button>
+      </div>
+
+      <section class="scan-card" aria-label="스캔 시작">
+        <div class="scan-card__icon">📄</div>
+        <div class="scan-card__copy">
+          <strong>오늘 스캔할 문서를 촬영하세요</strong>
+          <span>카메라 촬영 또는 사진 불러오기를 선택할 수 있습니다.</span>
+        </div>
+        <div class="scan-card__actions">
+          <button id="cameraBtn" class="primary">문서 스캔하기</button>
+          <button id="galleryBtn" class="secondary">사진에서 불러오기</button>
+        </div>
+      </section>
+
+      <input id="cameraInput" type="file" accept="image/*" capture="environment" hidden />
+      <input id="galleryInput" type="file" accept="image/*" multiple hidden />
+    </header>
+
+    <main>
+      <section class="panel" id="workspacePanel">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">Scan Pages</p>
+            <h2>스캔 페이지</h2>
+          </div>
+          <span id="pageCountBadge" class="badge">0장</span>
+        </div>
+
+        <div id="emptyState" class="empty-state">
+          <div class="empty-state__icon">📷</div>
+          <h3>아직 추가된 문서가 없습니다</h3>
+          <p>상단의 버튼으로 문서를 촬영하거나 사진을 불러와 주세요.</p>
+        </div>
+
+        <div id="pageList" class="page-list" aria-live="polite"></div>
+      </section>
+
+      <section class="panel controls-panel">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">PDF Output</p>
+            <h2>PDF 만들기</h2>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>파일명</span>
+          <input id="fileNameInput" type="text" autocomplete="off" />
+        </label>
+
+        <div class="quality-grid" role="radiogroup" aria-label="PDF 품질 선택">
+          <label class="quality-option">
+            <input type="radio" name="quality" value="high" />
+            <span>고화질</span>
+            <small>문서 보관용</small>
+          </label>
+          <label class="quality-option">
+            <input type="radio" name="quality" value="normal" checked />
+            <span>일반</span>
+            <small>추천</small>
+          </label>
+          <label class="quality-option">
+            <input type="radio" name="quality" value="small" />
+            <span>용량 작게</span>
+            <small>카톡 공유용</small>
+          </label>
+        </div>
+
+        <div class="button-row">
+          <button id="makePdfBtn" class="primary wide" disabled>PDF 생성하기</button>
+          <button id="clearPagesBtn" class="danger" disabled>전체 삭제</button>
+        </div>
+
+        <div id="pdfResult" class="pdf-result" hidden>
+          <div>
+            <strong id="pdfResultName">PDF 생성 완료</strong>
+            <span id="pdfResultMeta"></span>
+          </div>
+          <div class="button-row compact">
+            <button id="previewPdfBtn" class="secondary">미리보기</button>
+            <button id="sharePdfBtn" class="primary">공유하기</button>
+            <button id="downloadPdfBtn" class="secondary">저장하기</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">Recent Files</p>
+            <h2>최근 스캔 문서</h2>
+          </div>
+          <button id="clearHistoryBtn" class="ghost small">목록 비우기</button>
+        </div>
+        <div id="recentList" class="recent-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="cropDialog" class="crop-dialog">
+    <form method="dialog" class="crop-dialog__inner">
+      <div class="section-title">
+        <div>
+          <p class="eyebrow">Crop</p>
+          <h2>페이지 자르기</h2>
+        </div>
+        <button class="ghost small" value="cancel">닫기</button>
+      </div>
+
+      <div class="crop-preview-wrap">
+        <canvas id="cropPreview" aria-label="자르기 미리보기"></canvas>
+      </div>
+
+      <div class="crop-sliders">
+        <label>왼쪽 <input id="cropLeft" type="range" min="0" max="30" value="0" /></label>
+        <label>오른쪽 <input id="cropRight" type="range" min="0" max="30" value="0" /></label>
+        <label>위쪽 <input id="cropTop" type="range" min="0" max="30" value="0" /></label>
+        <label>아래쪽 <input id="cropBottom" type="range" min="0" max="30" value="0" /></label>
+      </div>
+
+      <div class="button-row">
+        <button id="resetCropBtn" class="secondary" type="button">자르기 초기화</button>
+        <button id="applyCropBtn" class="primary" value="default">적용하기</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
