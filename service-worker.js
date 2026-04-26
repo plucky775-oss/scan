@@ -1,4 +1,4 @@
-const CACHE_NAME = 'smart-scan-pwa-v6-white-bg-bw';
+const CACHE_NAME = 'smart-scan-pwa-v85-bg-white-final';
 const ASSETS = [
   './',
   './index.html',

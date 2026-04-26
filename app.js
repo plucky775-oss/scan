@@ -69,7 +69,7 @@ const FILTERS = [
 const FILTER_HELP = {
   original: '원본 그대로 표시합니다.',
   sharp: '글자와 선을 조금 더 선명하게 보정합니다.',
-  bw: '배경은 흰색에 가깝게 정리하고 글자와 선은 진하게 표현합니다. 밝기 조절로 흰 배경 강도를 조절할 수 있습니다.',
+  bw: '배경색을 최대한 날려 흰 종이처럼 만들고, 글자와 표 선만 진하게 남깁니다. 배경색 제거 강도로 흰색화 정도를 조절할 수 있습니다.',
   bright: '어두운 사진을 전체적으로 밝게 만듭니다.',
   contrast: '글자와 배경의 대비를 강하게 만듭니다.',
   shadow: '구김 자체를 펴는 기능이 아니라, 접힘·그림자·얼룩처럼 어두운 부분을 완화하는 보정입니다.',
@@ -504,7 +504,7 @@ async function addFiles(files) {
       width: img.naturalWidth,
       height: img.naturalHeight,
       filter: 'sharp',
-      bwBrightness: 104,
+      bwBrightness: 115,
       rotation: 0,
       crop: suggestedCrop,
     });
@@ -528,15 +528,15 @@ function renderPages() {
     `).join('');
 
     const cropStatus = page.crop?.type === 'quad' ? '문서영역 지정됨' : '전체 이미지';
-    const bwValue = Math.max(85, Math.min(120, Number(page.bwBrightness || 104)));
+    const bwValue = Math.max(100, Math.min(140, Number(page.bwBrightness || 115)));
     const bwControl = page.filter === 'bw' ? `
       <div class="adjust-card">
         <div class="adjust-card__head">
-          <strong>흑백 배경 밝기</strong>
+          <strong>배경색 제거 강도</strong>
           <span>${bwValue}%</span>
         </div>
-        <input class="range-input" type="range" min="85" max="120" value="${bwValue}" data-action="bw-brightness" data-id="${page.id}" />
-        <small>배경은 하얗게, 글자와 표 선은 진하게 보이도록 보정합니다. 너무 날아가면 살짝 낮추세요.</small>
+        <input class="range-input" type="range" min="100" max="140" value="${bwValue}" data-action="bw-brightness" data-id="${page.id}" />
+        <small>회색 종이색과 그림자를 흰색으로 날리고, 글자와 표 선은 진하게 남깁니다. 글자가 끊기면 살짝 낮추세요.</small>
       </div>
     ` : '';
 
@@ -626,7 +626,7 @@ async function renderPageToCanvas(page, options = {}) {
   const processed = rotateAndFilterCanvas(baseCanvas, page.rotation, page.filter);
 
   if (page.filter === 'bw') {
-    applyBlackWhite(processed, page.bwBrightness || 92);
+    applyBlackWhite(processed, page.bwBrightness || 115);
   } else if (page.filter === 'sharp') {
     applyMildSharpen(processed);
   } else if (page.filter === 'shadow' || page.filter === 'dewrinkle') {
@@ -753,7 +753,7 @@ function filterToCanvasFilter(filter) {
     case 'sharp': return 'brightness(1.05) contrast(1.22) saturate(0.95)';
     case 'bright': return 'brightness(1.18) contrast(1.05)';
     case 'contrast': return 'brightness(1.02) contrast(1.38)';
-    case 'bw': return 'grayscale(1) contrast(1.03) brightness(0.98)';
+    case 'bw': return 'none';
     case 'shadow':
     case 'dewrinkle': return 'grayscale(.08) brightness(1.03) contrast(1.10) saturate(.88)';
     default: return 'none';
@@ -796,7 +796,7 @@ function boxBlurGray(gray, width, height, radius) {
   return out;
 }
 
-function applyBlackWhite(canvas, brightnessPercent = 104) {
+function applyBlackWhite(canvas, brightnessPercent = 115) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = imageData.data;
@@ -808,36 +808,44 @@ function applyBlackWhite(canvas, brightnessPercent = 104) {
     gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
   }
 
-  // 큰 반경으로 배경 밝기를 추정해 종이 그림자와 접힘으로 인한 회색 영역을 먼저 평탄화합니다.
-  const largeRadius = Math.max(18, Math.min(76, Math.round(Math.min(width, height) / 18)));
-  const smallRadius = Math.max(4, Math.min(22, Math.round(Math.min(width, height) / 70)));
+  // 종이 전체의 그림자/회색 종이색을 먼저 추정하고, 글자·표 선처럼 주변보다 어두운 부분만 잉크로 남깁니다.
+  const largeRadius = Math.max(24, Math.min(96, Math.round(Math.min(width, height) / 14)));
+  const smallRadius = Math.max(3, Math.min(18, Math.round(Math.min(width, height) / 90)));
   const background = boxBlurGray(gray, width, height, largeRadius);
   const localMean = boxBlurGray(gray, width, height, smallRadius);
-  const whiteStrength = Math.max(0.85, Math.min(1.20, Number(brightnessPercent) / 100));
+  const whiteStrength = Math.max(1.00, Math.min(1.40, Number(brightnessPercent) / 100));
+  const backgroundCut = 12 + (whiteStrength - 1) * 10;
+  const localCut = 7 + (whiteStrength - 1) * 6;
 
   for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
-    // 그림자 보정: 배경이 어두운 곳은 종이색을 흰색 쪽으로 끌어올립니다.
-    const flattened = Math.max(0, Math.min(255, gray[p] + (248 - background[p]) * (0.95 + (whiteStrength - 1) * 0.40)));
+    const bg = background[p];
+    const g = gray[p];
+    const flattened = Math.max(0, Math.min(255, g + (252 - bg) * (1.05 + (whiteStrength - 1) * 0.55)));
+    const backgroundDarkness = bg - g;
+    const localDarkness = localMean[p] - g;
 
-    // 글자/표 선은 주변 배경보다 얼마나 어두운지로 판단합니다.
-    const backgroundDarkness = background[p] - gray[p];
-    const localDarkness = localMean[p] - gray[p];
-    const inkScore = Math.max(
-      (190 - flattened) / 72,
-      (backgroundDarkness - 12) / 58,
-      (localDarkness - 7) / 36
-    );
-    const ink = Math.max(0, Math.min(1, inkScore));
+    // 약한 회색 배경은 무조건 흰색으로 날리고, 글자/표 선처럼 실제 경계가 있는 부분만 남깁니다.
+    const likelyInk =
+      (localDarkness > localCut && g < 238) ||
+      (backgroundDarkness > backgroundCut && g < 235) ||
+      flattened < 126;
 
-    let value;
-    if (ink <= 0.03) {
-      // 배경은 회색이 아니라 거의 흰색으로 고정합니다.
-      value = 252 + Math.min(3, (whiteStrength - 0.85) * 9);
-    } else {
-      // 글자와 표 선은 진하게, 가장자리는 부드럽게 표현합니다.
-      const strongInk = Math.pow(ink, 0.72);
-      value = 252 - strongInk * 232;
-      if (flattened < 115 || backgroundDarkness > 80) value = Math.min(value, 32);
+    let value = 255;
+    if (likelyInk) {
+      const inkScore = Math.max(
+        (localDarkness - localCut) / 34,
+        (backgroundDarkness - backgroundCut) / 52,
+        (142 - flattened) / 40
+      );
+      const ink = Math.max(0, Math.min(1, inkScore));
+
+      if (ink < 0.08) {
+        value = 255;
+      } else {
+        const strongInk = Math.pow((ink - 0.08) / 0.92, 0.50);
+        value = 255 - strongInk * 248;
+        if (ink > 0.68 || flattened < 92) value = Math.min(value, 18);
+      }
     }
 
     data[i] = data[i + 1] = data[i + 2] = Math.max(0, Math.min(255, value));
