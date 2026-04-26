@@ -131,20 +131,15 @@
         <button class="ghost small" value="cancel">닫기</button>
       </div>
 
-      <div class="crop-preview-wrap">
-        <canvas id="cropPreview" aria-label="자르기 미리보기"></canvas>
+      <p class="crop-help">파란색 네 모서리를 손가락으로 움직여 문서 귀퉁이에 맞춘 뒤 적용하세요. 비스듬히 찍힌 문서도 PDF 생성 시 반듯하게 펴집니다.</p>
+
+      <div class="crop-preview-wrap touch-crop-wrap">
+        <canvas id="cropCanvas" aria-label="손가락으로 네 모서리를 조정하는 자르기 화면"></canvas>
       </div>
 
-      <div class="crop-sliders">
-        <label>왼쪽 <input id="cropLeft" type="range" min="0" max="30" value="0" /></label>
-        <label>오른쪽 <input id="cropRight" type="range" min="0" max="30" value="0" /></label>
-        <label>위쪽 <input id="cropTop" type="range" min="0" max="30" value="0" /></label>
-        <label>아래쪽 <input id="cropBottom" type="range" min="0" max="30" value="0" /></label>
-      </div>
-
-      <div class="button-row">
-        <button id="resetCropBtn" class="secondary" type="button">자르기 초기화</button>
-        <button id="applyCropBtn" class="primary" value="default">적용하기</button>
+      <div class="button-row crop-actions">
+        <button id="resetCropBtn" class="secondary" type="button">전체 맞춤</button>
+        <button id="applyCropBtn" class="primary" value="default">문서 펴서 적용</button>
       </div>
     </form>
   </dialog>

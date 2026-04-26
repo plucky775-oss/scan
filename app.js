@@ -1,11 +1,16 @@
 const $ = (selector) => document.querySelector(selector);
-const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 const state = {
   pages: [],
   currentPdf: null,
   editingCropPageId: null,
   deferredInstallPrompt: null,
+  cropEditor: {
+    img: null,
+    points: [],
+    scale: 1,
+    activeIndex: null,
+  },
 };
 
 const elements = {
@@ -29,11 +34,7 @@ const elements = {
   recentList: $('#recentList'),
   clearHistoryBtn: $('#clearHistoryBtn'),
   cropDialog: $('#cropDialog'),
-  cropPreview: $('#cropPreview'),
-  cropLeft: $('#cropLeft'),
-  cropRight: $('#cropRight'),
-  cropTop: $('#cropTop'),
-  cropBottom: $('#cropBottom'),
+  cropCanvas: $('#cropCanvas'),
   resetCropBtn: $('#resetCropBtn'),
   applyCropBtn: $('#applyCropBtn'),
   toast: $('#toast'),
@@ -45,6 +46,7 @@ const FILTERS = [
   { id: 'bw', label: '흑백' },
   { id: 'bright', label: '밝게' },
   { id: 'contrast', label: '대비' },
+  { id: 'dewrinkle', label: '구김완화' },
 ];
 
 const QUALITY = {
@@ -98,6 +100,18 @@ async function loadImage(src) {
   });
 }
 
+function defaultCrop() {
+  return {
+    type: 'quad',
+    points: [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 100, y: 100 },
+      { x: 0, y: 100 },
+    ],
+  };
+}
+
 async function addFiles(files) {
   const imageFiles = [...files].filter((file) => file.type.startsWith('image/'));
   if (!imageFiles.length) {
@@ -117,7 +131,7 @@ async function addFiles(files) {
       height: img.naturalHeight,
       filter: 'sharp',
       rotation: 0,
-      crop: { left: 0, right: 0, top: 0, bottom: 0 },
+      crop: defaultCrop(),
     });
   }
 
@@ -152,7 +166,7 @@ function renderPages() {
           <div class="filter-row">${filterButtons}</div>
           <div class="action-grid">
             <button class="icon-btn" data-action="rotate" data-id="${page.id}">회전</button>
-            <button class="icon-btn" data-action="crop" data-id="${page.id}">자르기</button>
+            <button class="icon-btn" data-action="crop" data-id="${page.id}">자르기/펼치기</button>
             <button class="icon-btn" data-action="up" data-id="${page.id}" ${index === 0 ? 'disabled' : ''}>위로</button>
             <button class="icon-btn" data-action="down" data-id="${page.id}" ${index === state.pages.length - 1 ? 'disabled' : ''}>아래로</button>
           </div>
@@ -182,51 +196,158 @@ async function renderThumb(page) {
   ctx.drawImage(rendered, x, y, drawWidth, drawHeight);
 }
 
-function getCroppedSourceRect(page, img) {
-  const left = img.naturalWidth * (page.crop.left / 100);
-  const right = img.naturalWidth * (page.crop.right / 100);
-  const top = img.naturalHeight * (page.crop.top / 100);
-  const bottom = img.naturalHeight * (page.crop.bottom / 100);
-  const sx = left;
-  const sy = top;
-  const sw = Math.max(10, img.naturalWidth - left - right);
-  const sh = Math.max(10, img.naturalHeight - top - bottom);
-  return { sx, sy, sw, sh };
+function getQuadPoints(page, img) {
+  if (page.crop?.type === 'quad' && Array.isArray(page.crop.points) && page.crop.points.length === 4) {
+    return page.crop.points.map((point) => ({
+      x: Math.max(0, Math.min(img.naturalWidth, img.naturalWidth * (point.x / 100))),
+      y: Math.max(0, Math.min(img.naturalHeight, img.naturalHeight * (point.y / 100))),
+    }));
+  }
+
+  const crop = page.crop || { left: 0, right: 0, top: 0, bottom: 0 };
+  const left = img.naturalWidth * ((crop.left || 0) / 100);
+  const right = img.naturalWidth * (1 - ((crop.right || 0) / 100));
+  const top = img.naturalHeight * ((crop.top || 0) / 100);
+  const bottom = img.naturalHeight * (1 - ((crop.bottom || 0) / 100));
+  return [
+    { x: left, y: top },
+    { x: right, y: top },
+    { x: right, y: bottom },
+    { x: left, y: bottom },
+  ];
+}
+
+function distance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
 async function renderPageToCanvas(page, options = {}) {
   const { maxWidth = 1400 } = options;
   const img = await loadImage(page.dataUrl);
-  const { sx, sy, sw, sh } = getCroppedSourceRect(page, img);
-  const baseScale = Math.min(1, maxWidth / sw);
-  const scaledWidth = Math.max(1, Math.round(sw * baseScale));
-  const scaledHeight = Math.max(1, Math.round(sh * baseScale));
-  const rotated = page.rotation % 180 !== 0;
-
-  const canvas = document.createElement('canvas');
-  canvas.width = rotated ? scaledHeight : scaledWidth;
-  canvas.height = rotated ? scaledWidth : scaledHeight;
-  const ctx = canvas.getContext('2d', { willReadFrequently: page.filter === 'bw' });
-  ctx.save();
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  if (page.rotation) {
-    ctx.translate(canvas.width / 2, canvas.height / 2);
-    ctx.rotate((page.rotation * Math.PI) / 180);
-    ctx.translate(-scaledWidth / 2, -scaledHeight / 2);
-  }
-
-  ctx.filter = filterToCanvasFilter(page.filter);
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, scaledWidth, scaledHeight);
-  ctx.restore();
+  const quad = getQuadPoints(page, img);
+  const baseCanvas = warpQuadToCanvas(img, quad, maxWidth);
+  const processed = rotateAndFilterCanvas(baseCanvas, page.rotation, page.filter);
 
   if (page.filter === 'bw') {
-    applyBlackWhite(canvas);
+    applyBlackWhite(processed);
   } else if (page.filter === 'sharp') {
-    applyMildSharpen(canvas);
+    applyMildSharpen(processed);
+  } else if (page.filter === 'dewrinkle') {
+    applyDocumentClean(processed);
+    applyMildSharpen(processed);
   }
 
+  return processed;
+}
+
+function warpQuadToCanvas(img, points, maxWidth) {
+  const [tl, tr, br, bl] = points;
+  const widthTop = distance(tl, tr);
+  const widthBottom = distance(bl, br);
+  const heightLeft = distance(tl, bl);
+  const heightRight = distance(tr, br);
+  const sourceWidth = Math.max(20, widthTop, widthBottom);
+  const sourceHeight = Math.max(20, heightLeft, heightRight);
+  const scale = Math.min(1, maxWidth / sourceWidth);
+  const targetWidth = Math.max(20, Math.round(sourceWidth * scale));
+  const targetHeight = Math.max(20, Math.round(sourceHeight * scale));
+
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = img.naturalWidth;
+  srcCanvas.height = img.naturalHeight;
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  srcCtx.drawImage(img, 0, 0);
+  const srcData = srcCtx.getImageData(0, 0, srcCanvas.width, srcCanvas.height).data;
+
+  const out = document.createElement('canvas');
+  out.width = targetWidth;
+  out.height = targetHeight;
+  const outCtx = out.getContext('2d', { willReadFrequently: true });
+  const outImage = outCtx.createImageData(targetWidth, targetHeight);
+  const outData = outImage.data;
+
+  const h = homographyFromRectToQuad(targetWidth, targetHeight, points);
+  for (let y = 0; y < targetHeight; y += 1) {
+    for (let x = 0; x < targetWidth; x += 1) {
+      const denom = h[6] * x + h[7] * y + 1;
+      const sx = (h[0] * x + h[1] * y + h[2]) / denom;
+      const sy = (h[3] * x + h[4] * y + h[5]) / denom;
+      const srcX = Math.max(0, Math.min(srcCanvas.width - 1, Math.round(sx)));
+      const srcY = Math.max(0, Math.min(srcCanvas.height - 1, Math.round(sy)));
+      const srcIndex = (srcY * srcCanvas.width + srcX) * 4;
+      const outIndex = (y * targetWidth + x) * 4;
+      outData[outIndex] = srcData[srcIndex];
+      outData[outIndex + 1] = srcData[srcIndex + 1];
+      outData[outIndex + 2] = srcData[srcIndex + 2];
+      outData[outIndex + 3] = 255;
+    }
+  }
+  outCtx.putImageData(outImage, 0, 0);
+  return out;
+}
+
+function homographyFromRectToQuad(width, height, points) {
+  const src = [
+    { x: 0, y: 0 },
+    { x: width - 1, y: 0 },
+    { x: width - 1, y: height - 1 },
+    { x: 0, y: height - 1 },
+  ];
+  const matrix = [];
+  const rhs = [];
+  for (let i = 0; i < 4; i += 1) {
+    const x = src[i].x;
+    const y = src[i].y;
+    const u = points[i].x;
+    const v = points[i].y;
+    matrix.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
+    rhs.push(u);
+    matrix.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
+    rhs.push(v);
+  }
+  return solveLinearSystem(matrix, rhs).concat(1);
+}
+
+function solveLinearSystem(matrix, rhs) {
+  const n = rhs.length;
+  const a = matrix.map((row, i) => row.concat(rhs[i]));
+
+  for (let col = 0; col < n; col += 1) {
+    let pivot = col;
+    for (let row = col + 1; row < n; row += 1) {
+      if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+    }
+    if (Math.abs(a[pivot][col]) < 1e-10) return [1, 0, 0, 0, 1, 0, 0, 0];
+    [a[col], a[pivot]] = [a[pivot], a[col]];
+    const pivotValue = a[col][col];
+    for (let j = col; j <= n; j += 1) a[col][j] /= pivotValue;
+    for (let row = 0; row < n; row += 1) {
+      if (row === col) continue;
+      const factor = a[row][col];
+      for (let j = col; j <= n; j += 1) a[row][j] -= factor * a[col][j];
+    }
+  }
+  return a.map((row) => row[n]);
+}
+
+function rotateAndFilterCanvas(source, rotation, filter) {
+  const normalizedRotation = ((rotation % 360) + 360) % 360;
+  const rotated = normalizedRotation % 180 !== 0;
+  const canvas = document.createElement('canvas');
+  canvas.width = rotated ? source.height : source.width;
+  canvas.height = rotated ? source.width : source.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: ['bw', 'sharp', 'dewrinkle'].includes(filter) });
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  if (normalizedRotation) {
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate((normalizedRotation * Math.PI) / 180);
+    ctx.translate(-source.width / 2, -source.height / 2);
+  }
+  ctx.filter = filterToCanvasFilter(filter);
+  ctx.drawImage(source, 0, 0);
+  ctx.restore();
   return canvas;
 }
 
@@ -236,6 +357,7 @@ function filterToCanvasFilter(filter) {
     case 'bright': return 'brightness(1.18) contrast(1.05)';
     case 'contrast': return 'brightness(1.02) contrast(1.38)';
     case 'bw': return 'grayscale(1) contrast(1.35) brightness(1.08)';
+    case 'dewrinkle': return 'grayscale(.15) brightness(1.16) contrast(1.25) saturate(.8)';
     default: return 'none';
   }
 }
@@ -252,6 +374,21 @@ function applyBlackWhite(canvas) {
   ctx.putImageData(imageData, 0, 0);
 }
 
+function applyDocumentClean(canvas) {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    const normalized = gray < 120 ? gray * 0.82 : 255 - ((255 - gray) * 0.36);
+    const value = Math.max(0, Math.min(255, normalized));
+    data[i] = data[i] * 0.25 + value * 0.75;
+    data[i + 1] = data[i + 1] * 0.25 + value * 0.75;
+    data[i + 2] = data[i + 2] * 0.25 + value * 0.75;
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
 function applyMildSharpen(canvas) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const w = canvas.width;
@@ -262,6 +399,14 @@ function applyMildSharpen(canvas) {
   const s = src.data;
   const d = dst.data;
   const kernel = [0, -0.25, 0, -0.25, 2, -0.25, 0, -0.25, 0];
+
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = s[i];
+    d[i + 1] = s[i + 1];
+    d[i + 2] = s[i + 2];
+    d[i + 3] = s[i + 3];
+  }
+
   for (let y = 1; y < h - 1; y += 1) {
     for (let x = 1; x < w - 1; x += 1) {
       for (let c = 0; c < 3; c += 1) {
@@ -475,37 +620,108 @@ async function getRecentRecord(id) {
   };
 }
 
-function openCropDialog(page) {
+async function openCropDialog(page) {
   state.editingCropPageId = page.id;
-  elements.cropLeft.value = page.crop.left;
-  elements.cropRight.value = page.crop.right;
-  elements.cropTop.value = page.crop.top;
-  elements.cropBottom.value = page.crop.bottom;
-  updateCropPreview();
   elements.cropDialog.showModal();
+  showToast('네 모서리를 손가락으로 조정하세요.');
+  const img = await loadImage(page.dataUrl);
+  state.cropEditor.img = img;
+  const quad = getQuadPoints(page, img);
+  state.cropEditor.points = quad.map((point) => ({ ...point }));
+  state.cropEditor.activeIndex = null;
+  drawCropEditor();
 }
 
-async function updateCropPreview() {
-  const page = pageById(state.editingCropPageId);
-  if (!page) return;
-  const tempPage = {
-    ...page,
-    crop: {
-      left: Number(elements.cropLeft.value),
-      right: Number(elements.cropRight.value),
-      top: Number(elements.cropTop.value),
-      bottom: Number(elements.cropBottom.value),
-    },
+function drawCropEditor() {
+  const { img, points } = state.cropEditor;
+  if (!img || points.length !== 4) return;
+
+  const maxWidth = Math.min(680, window.innerWidth - 62);
+  const maxHeight = Math.min(Math.max(340, window.innerHeight * 0.62), 720);
+  const scale = Math.min(maxWidth / img.naturalWidth, maxHeight / img.naturalHeight, 1);
+  state.cropEditor.scale = scale;
+
+  const canvas = elements.cropCanvas;
+  canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  const scaled = points.map((point) => ({ x: point.x * scale, y: point.y * scale }));
+  ctx.save();
+  ctx.fillStyle = 'rgba(47, 128, 237, 0.16)';
+  ctx.strokeStyle = '#2f80ed';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(scaled[0].x, scaled[0].y);
+  for (let i = 1; i < scaled.length; i += 1) ctx.lineTo(scaled[i].x, scaled[i].y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  scaled.forEach((point, index) => {
+    ctx.beginPath();
+    ctx.fillStyle = index === state.cropEditor.activeIndex ? '#20c997' : '#ffffff';
+    ctx.strokeStyle = '#2f80ed';
+    ctx.lineWidth = 4;
+    ctx.arc(point.x, point.y, 13, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+function getCanvasPointer(event) {
+  const rect = elements.cropCanvas.getBoundingClientRect();
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
   };
-  const canvas = await renderPageToCanvas(tempPage, { maxWidth: 700 });
-  const preview = elements.cropPreview;
-  const ctx = preview.getContext('2d');
-  const maxPreviewWidth = Math.min(620, window.innerWidth - 70);
-  const scale = Math.min(1, maxPreviewWidth / canvas.width, 480 / canvas.height);
-  preview.width = Math.round(canvas.width * scale);
-  preview.height = Math.round(canvas.height * scale);
-  ctx.clearRect(0, 0, preview.width, preview.height);
-  ctx.drawImage(canvas, 0, 0, preview.width, preview.height);
+}
+
+function nearestCropHandle(pointer) {
+  const { points, scale } = state.cropEditor;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  points.forEach((point, index) => {
+    const dx = pointer.x - point.x * scale;
+    const dy = pointer.y - point.y * scale;
+    const dist = Math.hypot(dx, dy);
+    if (dist < nearestDistance) {
+      nearest = index;
+      nearestDistance = dist;
+    }
+  });
+  return nearestDistance <= 46 ? nearest : nearest;
+}
+
+function moveCropHandle(event) {
+  const { img, scale, activeIndex } = state.cropEditor;
+  if (!img || activeIndex === null) return;
+  const pointer = getCanvasPointer(event);
+  state.cropEditor.points[activeIndex] = {
+    x: Math.max(0, Math.min(img.naturalWidth, pointer.x / scale)),
+    y: Math.max(0, Math.min(img.naturalHeight, pointer.y / scale)),
+  };
+  drawCropEditor();
+}
+
+function applyCropEditor() {
+  const page = pageById(state.editingCropPageId);
+  const { img, points } = state.cropEditor;
+  if (!page || !img || points.length !== 4) return;
+  page.crop = {
+    type: 'quad',
+    points: points.map((point) => ({
+      x: Math.max(0, Math.min(100, (point.x / img.naturalWidth) * 100)),
+      y: Math.max(0, Math.min(100, (point.y / img.naturalHeight) * 100)),
+    })),
+  };
+  state.currentPdf = null;
+  elements.pdfResult.hidden = true;
+  renderPages();
+  showToast('문서 영역을 적용했습니다.');
 }
 
 function bindEvents() {
@@ -573,31 +789,56 @@ function bindEvents() {
     showToast('최근 문서 목록을 비웠습니다.');
   });
 
-  [elements.cropLeft, elements.cropRight, elements.cropTop, elements.cropBottom].forEach((input) => {
-    input.addEventListener('input', updateCropPreview);
+  elements.cropCanvas.addEventListener('pointerdown', (event) => {
+    if (!state.cropEditor.img) return;
+    event.preventDefault();
+    elements.cropCanvas.setPointerCapture(event.pointerId);
+    state.cropEditor.activeIndex = nearestCropHandle(getCanvasPointer(event));
+    moveCropHandle(event);
+  });
+
+  elements.cropCanvas.addEventListener('pointermove', (event) => {
+    if (state.cropEditor.activeIndex === null) return;
+    event.preventDefault();
+    moveCropHandle(event);
+  });
+
+  elements.cropCanvas.addEventListener('pointerup', (event) => {
+    state.cropEditor.activeIndex = null;
+    try { elements.cropCanvas.releasePointerCapture(event.pointerId); } catch (error) { /* ignore */ }
+    drawCropEditor();
+  });
+
+  elements.cropCanvas.addEventListener('pointercancel', () => {
+    state.cropEditor.activeIndex = null;
+    drawCropEditor();
   });
 
   elements.resetCropBtn.addEventListener('click', () => {
-    elements.cropLeft.value = 0;
-    elements.cropRight.value = 0;
-    elements.cropTop.value = 0;
-    elements.cropBottom.value = 0;
-    updateCropPreview();
+    const { img } = state.cropEditor;
+    if (!img) return;
+    state.cropEditor.points = [
+      { x: 0, y: 0 },
+      { x: img.naturalWidth, y: 0 },
+      { x: img.naturalWidth, y: img.naturalHeight },
+      { x: 0, y: img.naturalHeight },
+    ];
+    drawCropEditor();
   });
 
   elements.applyCropBtn.addEventListener('click', () => {
-    const page = pageById(state.editingCropPageId);
-    if (!page) return;
-    page.crop = {
-      left: Number(elements.cropLeft.value),
-      right: Number(elements.cropRight.value),
-      top: Number(elements.cropTop.value),
-      bottom: Number(elements.cropBottom.value),
-    };
-    state.currentPdf = null;
-    elements.pdfResult.hidden = true;
-    renderPages();
-    showToast('자르기를 적용했습니다.');
+    applyCropEditor();
+  });
+
+  elements.cropDialog.addEventListener('close', () => {
+    state.editingCropPageId = null;
+    state.cropEditor.img = null;
+    state.cropEditor.points = [];
+    state.cropEditor.activeIndex = null;
+  });
+
+  window.addEventListener('resize', () => {
+    if (elements.cropDialog.open) drawCropEditor();
   });
 
   window.addEventListener('beforeinstallprompt', (event) => {
