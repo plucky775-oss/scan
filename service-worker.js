@@ -1,4 +1,4 @@
-const CACHE_NAME = 'smart-scan-pwa-v2-touch-crop';
+const CACHE_NAME = 'smart-scan-pwa-v3-85';
 const ASSETS = [
   './',
   './index.html',

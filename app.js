@@ -5,6 +5,7 @@ const state = {
   currentPdf: null,
   editingCropPageId: null,
   deferredInstallPrompt: null,
+  autoNameEnabled: true,
   cropEditor: {
     img: null,
     points: [],
@@ -22,7 +23,10 @@ const elements = {
   pageList: $('#pageList'),
   emptyState: $('#emptyState'),
   pageCountBadge: $('#pageCountBadge'),
+  documentTypeSelect: $('#documentTypeSelect'),
+  fileMemoInput: $('#fileMemoInput'),
   fileNameInput: $('#fileNameInput'),
+  autoNameBtn: $('#autoNameBtn'),
   makePdfBtn: $('#makePdfBtn'),
   clearPagesBtn: $('#clearPagesBtn'),
   pdfResult: $('#pdfResult'),
@@ -32,9 +36,14 @@ const elements = {
   sharePdfBtn: $('#sharePdfBtn'),
   downloadPdfBtn: $('#downloadPdfBtn'),
   recentList: $('#recentList'),
+  recentSearchInput: $('#recentSearchInput'),
+  storageInfo: $('#storageInfo'),
+  refreshStorageBtn: $('#refreshStorageBtn'),
+  clearOldHistoryBtn: $('#clearOldHistoryBtn'),
   clearHistoryBtn: $('#clearHistoryBtn'),
   cropDialog: $('#cropDialog'),
   cropCanvas: $('#cropCanvas'),
+  autoCropBtn: $('#autoCropBtn'),
   resetCropBtn: $('#resetCropBtn'),
   applyCropBtn: $('#applyCropBtn'),
   toast: $('#toast'),
@@ -55,10 +64,37 @@ const QUALITY = {
   small: { maxWidth: 1000, jpeg: 0.68, label: '용량 작게' },
 };
 
+function pad(num) {
+  return String(num).padStart(2, '0');
+}
+
+function sanitizeFilePart(value) {
+  return String(value || '')
+    .trim()
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 28);
+}
+
+function currentDocumentMeta() {
+  return {
+    docType: elements.documentTypeSelect?.value || '스캔문서',
+    memo: sanitizeFilePart(elements.fileMemoInput?.value || ''),
+  };
+}
+
 function getDefaultFileName() {
   const now = new Date();
-  const pad = (num) => String(num).padStart(2, '0');
-  return `스캔문서_${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const { docType, memo } = currentDocumentMeta();
+  const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
+  return [docType, memo, date, time].filter(Boolean).join('_');
+}
+
+function updateAutoFileName(force = false) {
+  if (!force && !state.autoNameEnabled) return;
+  elements.fileNameInput.value = getDefaultFileName();
+  state.autoNameEnabled = true;
 }
 
 elements.fileNameInput.value = getDefaultFileName();
@@ -112,6 +148,104 @@ function defaultCrop() {
   };
 }
 
+function fullImagePoints(img) {
+  return [
+    { x: 0, y: 0 },
+    { x: img.naturalWidth, y: 0 },
+    { x: img.naturalWidth, y: img.naturalHeight },
+    { x: 0, y: img.naturalHeight },
+  ];
+}
+
+function pointsToPercentCrop(points, img) {
+  return {
+    type: 'quad',
+    points: points.map((point) => ({
+      x: Math.max(0, Math.min(100, (point.x / img.naturalWidth) * 100)),
+      y: Math.max(0, Math.min(100, (point.y / img.naturalHeight) * 100)),
+    })),
+  };
+}
+
+function percentile(values, ratio) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * ratio)))];
+}
+
+function detectDocumentPoints(img) {
+  const maxSide = 520;
+  const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, width, height);
+  const data = ctx.getImageData(0, 0, width, height).data;
+
+  const grays = [];
+  for (let i = 0; i < data.length; i += 16) {
+    grays.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+  }
+
+  const threshold = Math.max(142, percentile(grays, 0.68));
+  let minX = width;
+  let minY = height;
+  let maxX = 0;
+  let maxY = 0;
+  let count = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * 4;
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+      const saturation = Math.max(r, g, b) - Math.min(r, g, b);
+      const isDocumentLike = gray >= threshold && (saturation < 95 || gray > 205);
+      if (!isDocumentLike) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+      count += 1;
+    }
+  }
+
+  const area = (maxX - minX) * (maxY - minY);
+  const total = width * height;
+  if (count < total * 0.08 || area < total * 0.18) return null;
+
+  const padX = width * 0.025;
+  const padY = height * 0.025;
+  minX = Math.max(0, minX - padX);
+  minY = Math.max(0, minY - padY);
+  maxX = Math.min(width - 1, maxX + padX);
+  maxY = Math.min(height - 1, maxY + padY);
+
+  const detectedWidth = maxX - minX;
+  const detectedHeight = maxY - minY;
+  if (detectedWidth < width * 0.32 || detectedHeight < height * 0.32) return null;
+
+  return [
+    { x: minX / scale, y: minY / scale },
+    { x: maxX / scale, y: minY / scale },
+    { x: maxX / scale, y: maxY / scale },
+    { x: minX / scale, y: maxY / scale },
+  ];
+}
+
+function suggestCropPoints(img) {
+  return detectDocumentPoints(img) || fullImagePoints(img);
+}
+
+function suggestCropPercent(img) {
+  return pointsToPercentCrop(suggestCropPoints(img), img);
+}
+
 async function addFiles(files) {
   const imageFiles = [...files].filter((file) => file.type.startsWith('image/'));
   if (!imageFiles.length) {
@@ -122,6 +256,7 @@ async function addFiles(files) {
   for (const file of imageFiles) {
     const dataUrl = await fileToDataUrl(file);
     const img = await loadImage(dataUrl);
+    const suggestedCrop = suggestCropPercent(img) || defaultCrop();
     state.pages.push({
       id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
       name: file.name || `page-${state.pages.length + 1}.jpg`,
@@ -131,7 +266,7 @@ async function addFiles(files) {
       height: img.naturalHeight,
       filter: 'sharp',
       rotation: 0,
-      crop: defaultCrop(),
+      crop: suggestedCrop,
     });
   }
 
@@ -475,7 +610,18 @@ async function makePdf() {
     const blob = pdf.output('blob');
     const file = new File([blob], fileName, { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
-    state.currentPdf = { fileName, blob, file, url, createdAt: new Date().toISOString(), pageCount: state.pages.length };
+    const meta = currentDocumentMeta();
+    state.currentPdf = {
+      fileName,
+      blob,
+      file,
+      url,
+      createdAt: new Date().toISOString(),
+      pageCount: state.pages.length,
+      docType: meta.docType,
+      memo: meta.memo,
+      quality: quality.label,
+    };
 
     await saveRecentPdf(state.currentPdf);
     renderPdfResult();
@@ -570,6 +716,9 @@ async function saveRecentPdf(pdfItem) {
     createdAt: pdfItem.createdAt,
     pageCount: pdfItem.pageCount,
     size: pdfItem.blob.size,
+    docType: pdfItem.docType || '스캔문서',
+    memo: pdfItem.memo || '',
+    quality: pdfItem.quality || '',
   };
   await idb('put', record);
 }
@@ -586,17 +735,42 @@ async function getRecentPdfs() {
 
 async function renderRecentList() {
   const records = await getRecentPdfs();
+  await updateStorageInfo(records);
+
+  const query = (elements.recentSearchInput?.value || '').trim().toLowerCase();
+  const filtered = records.filter((record) => {
+    if (!query) return true;
+    const created = new Date(record.createdAt).toLocaleString('ko-KR', { dateStyle: 'medium', timeStyle: 'short' });
+    return [
+      record.fileName,
+      record.docType,
+      record.memo,
+      record.quality,
+      created,
+    ].filter(Boolean).join(' ').toLowerCase().includes(query);
+  });
+
   if (!records.length) {
     elements.recentList.innerHTML = `<div class="empty-state"><div class="empty-state__icon">🗂️</div><h3>최근 문서가 없습니다</h3><p>PDF를 생성하면 여기에 저장됩니다.</p></div>`;
     return;
   }
-  elements.recentList.innerHTML = records.slice(0, 30).map((record) => {
+
+  if (!filtered.length) {
+    elements.recentList.innerHTML = `<div class="empty-state"><div class="empty-state__icon">🔎</div><h3>검색 결과가 없습니다</h3><p>다른 파일명, 문서 종류, 날짜로 검색해 주세요.</p></div>`;
+    return;
+  }
+
+  elements.recentList.innerHTML = filtered.slice(0, 30).map((record) => {
     const created = new Date(record.createdAt).toLocaleString('ko-KR', { dateStyle: 'medium', timeStyle: 'short' });
+    const typeLabel = record.docType || '스캔문서';
+    const memo = record.memo ? ` · ${record.memo}` : '';
+    const quality = record.quality ? ` · ${record.quality}` : '';
     return `
       <div class="recent-item" data-recent-id="${record.id}">
         <div>
+          <div class="recent-item__type">${typeLabel}</div>
           <div class="recent-item__name">${record.fileName}</div>
-          <div class="recent-item__meta">${created} · ${record.pageCount}장 · ${formatBytes(record.size)}</div>
+          <div class="recent-item__meta">${created}${memo} · ${record.pageCount}장 · ${formatBytes(record.size)}${quality}</div>
         </div>
         <div class="recent-item__actions">
           <button class="secondary small" data-action="recent-open" data-id="${record.id}">열기</button>
@@ -607,6 +781,43 @@ async function renderRecentList() {
       </div>
     `;
   }).join('');
+}
+
+async function updateStorageInfo(records = null) {
+  const items = records || await getRecentPdfs();
+  const pdfTotal = items.reduce((sum, item) => sum + (item.size || item.blob?.size || 0), 0);
+  let usageText = '';
+  if (navigator.storage?.estimate) {
+    try {
+      const estimate = await navigator.storage.estimate();
+      if (estimate.usage) {
+        usageText = ` · 브라우저 사용량 ${formatBytes(estimate.usage)}`;
+        if (estimate.quota) usageText += ` / ${formatBytes(estimate.quota)}`;
+      }
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+  elements.storageInfo.textContent = `저장된 PDF ${items.length}개 · PDF 용량 ${formatBytes(pdfTotal)}${usageText}`;
+}
+
+async function clearOldRecentPdfs() {
+  const records = await getRecentPdfs();
+  const now = Date.now();
+  const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+  const removeTargets = records
+    .slice(20)
+    .concat(records.slice(0, 20).filter((record) => now - new Date(record.createdAt).getTime() > thirtyDays));
+  const uniqueTargets = [...new Map(removeTargets.map((record) => [record.id, record])).values()];
+
+  if (!uniqueTargets.length) {
+    showToast('정리할 오래된 문서가 없습니다.');
+    return;
+  }
+
+  await Promise.all(uniqueTargets.map((record) => idb('delete', record.id)));
+  await renderRecentList();
+  showToast(`${uniqueTargets.length}개의 오래된 문서를 정리했습니다.`);
 }
 
 async function getRecentRecord(id) {
@@ -725,6 +936,13 @@ function applyCropEditor() {
 }
 
 function bindEvents() {
+  elements.documentTypeSelect.addEventListener('change', () => updateAutoFileName(false));
+  elements.fileMemoInput.addEventListener('input', () => updateAutoFileName(false));
+  elements.fileNameInput.addEventListener('input', () => {
+    state.autoNameEnabled = elements.fileNameInput.value.trim() === '';
+  });
+  elements.autoNameBtn.addEventListener('click', () => updateAutoFileName(true));
+
   elements.cameraBtn.addEventListener('click', () => elements.cameraInput.click());
   elements.galleryBtn.addEventListener('click', () => elements.galleryInput.click());
   elements.cameraInput.addEventListener('change', (event) => addFiles(event.target.files).finally(() => { event.target.value = ''; }));
@@ -783,6 +1001,13 @@ function bindEvents() {
     if (action === 'recent-download') downloadBlob(record.blob, record.fileName);
   });
 
+  elements.recentSearchInput.addEventListener('input', renderRecentList);
+  elements.refreshStorageBtn.addEventListener('click', async () => {
+    await renderRecentList();
+    showToast('저장공간 정보를 갱신했습니다.');
+  });
+  elements.clearOldHistoryBtn.addEventListener('click', clearOldRecentPdfs);
+
   elements.clearHistoryBtn.addEventListener('click', async () => {
     await idb('clear');
     await renderRecentList();
@@ -814,15 +1039,18 @@ function bindEvents() {
     drawCropEditor();
   });
 
+  elements.autoCropBtn.addEventListener('click', () => {
+    const { img } = state.cropEditor;
+    if (!img) return;
+    state.cropEditor.points = suggestCropPoints(img);
+    drawCropEditor();
+    showToast('문서 테두리를 추천했습니다. 필요하면 손가락으로 미세 조정하세요.');
+  });
+
   elements.resetCropBtn.addEventListener('click', () => {
     const { img } = state.cropEditor;
     if (!img) return;
-    state.cropEditor.points = [
-      { x: 0, y: 0 },
-      { x: img.naturalWidth, y: 0 },
-      { x: img.naturalWidth, y: img.naturalHeight },
-      { x: 0, y: img.naturalHeight },
-    ];
+    state.cropEditor.points = fullImagePoints(img);
     drawCropEditor();
   });
 
