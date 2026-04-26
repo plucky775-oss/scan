@@ -173,8 +173,216 @@ function percentile(values, ratio) {
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * ratio)))];
 }
 
+function safeInsetPoints(img, ratio = 0.045) {
+  const insetX = img.naturalWidth * ratio;
+  const insetY = img.naturalHeight * ratio;
+  return [
+    { x: insetX, y: insetY },
+    { x: img.naturalWidth - insetX, y: insetY },
+    { x: img.naturalWidth - insetX, y: img.naturalHeight - insetY },
+    { x: insetX, y: img.naturalHeight - insetY },
+  ];
+}
+
+function clampPoint(point, width, height) {
+  return {
+    x: Math.max(0, Math.min(width - 1, point.x)),
+    y: Math.max(0, Math.min(height - 1, point.y)),
+  };
+}
+
+function fitLine(points) {
+  if (points.length < 8) return null;
+
+  const solve = (items) => {
+    let sumU = 0;
+    let sumV = 0;
+    let sumUU = 0;
+    let sumUV = 0;
+    for (const point of items) {
+      sumU += point.u;
+      sumV += point.v;
+      sumUU += point.u * point.u;
+      sumUV += point.u * point.v;
+    }
+    const n = items.length;
+    const denom = (n * sumUU) - (sumU * sumU);
+    if (Math.abs(denom) < 1e-6) return null;
+    const a = ((n * sumUV) - (sumU * sumV)) / denom;
+    const b = (sumV - (a * sumU)) / n;
+    return { a, b };
+  };
+
+  let line = solve(points);
+  if (!line) return null;
+
+  const residuals = points.map((point) => Math.abs(point.v - (line.a * point.u + line.b))).sort((a, b) => a - b);
+  const limit = Math.max(3, residuals[Math.floor(residuals.length * 0.72)] * 1.7);
+  const trimmed = points.filter((point) => Math.abs(point.v - (line.a * point.u + line.b)) <= limit);
+  if (trimmed.length >= 8 && trimmed.length < points.length) line = solve(trimmed) || line;
+  return line;
+}
+
+function intersectLeftRightWithTopBottom(verticalLine, horizontalLine) {
+  // verticalLine: x = a*y + b, horizontalLine: y = a*x + b
+  if (!verticalLine || !horizontalLine) return null;
+  const denom = 1 - (verticalLine.a * horizontalLine.a);
+  if (Math.abs(denom) < 1e-6) return null;
+  const y = (horizontalLine.a * verticalLine.b + horizontalLine.b) / denom;
+  const x = verticalLine.a * y + verticalLine.b;
+  return { x, y };
+}
+
+function getLargestMaskComponent(mask, width, height) {
+  const visited = new Uint8Array(width * height);
+  const queue = new Int32Array(width * height);
+  let best = null;
+
+  for (let start = 0; start < mask.length; start += 1) {
+    if (!mask[start] || visited[start]) continue;
+
+    let head = 0;
+    let tail = 0;
+    let count = 0;
+    let minX = width;
+    let minY = height;
+    let maxX = 0;
+    let maxY = 0;
+    const points = [];
+
+    visited[start] = 1;
+    queue[tail++] = start;
+
+    while (head < tail) {
+      const index = queue[head++];
+      const x = index % width;
+      const y = Math.floor(index / width);
+      count += 1;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+      points.push({ x, y });
+
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (!dx && !dy) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const next = ny * width + nx;
+          if (mask[next] && !visited[next]) {
+            visited[next] = 1;
+            queue[tail++] = next;
+          }
+        }
+      }
+    }
+
+    const bboxArea = Math.max(1, (maxX - minX + 1) * (maxY - minY + 1));
+    const fillRatio = count / bboxArea;
+    const score = count * Math.min(1.25, 0.65 + fillRatio);
+    if (!best || score > best.score) best = { score, count, minX, minY, maxX, maxY, points };
+  }
+
+  return best;
+}
+
+function pointsLookValid(points, width, height) {
+  if (!points || points.length !== 4 || points.some((p) => !Number.isFinite(p.x) || !Number.isFinite(p.y))) return false;
+  const [tl, tr, br, bl] = points;
+  const top = distance(tl, tr);
+  const bottom = distance(bl, br);
+  const left = distance(tl, bl);
+  const right = distance(tr, br);
+  const area = Math.abs(
+    tl.x * tr.y - tl.y * tr.x +
+    tr.x * br.y - tr.y * br.x +
+    br.x * bl.y - br.y * bl.x +
+    bl.x * tl.y - bl.y * tl.x
+  ) / 2;
+  if (Math.min(top, bottom) < width * 0.18) return false;
+  if (Math.min(left, right) < height * 0.18) return false;
+  if (area < width * height * 0.12) return false;
+  return true;
+}
+
+function componentToDocumentPoints(component, width, height, scale) {
+  if (!component || !component.points?.length) return null;
+
+  const rowMin = new Array(height).fill(Infinity);
+  const rowMax = new Array(height).fill(-Infinity);
+  const rowCount = new Array(height).fill(0);
+  const colMin = new Array(width).fill(Infinity);
+  const colMax = new Array(width).fill(-Infinity);
+  const colCount = new Array(width).fill(0);
+
+  for (const point of component.points) {
+    const { x, y } = point;
+    rowMin[y] = Math.min(rowMin[y], x);
+    rowMax[y] = Math.max(rowMax[y], x);
+    rowCount[y] += 1;
+    colMin[x] = Math.min(colMin[x], y);
+    colMax[x] = Math.max(colMax[x], y);
+    colCount[x] += 1;
+  }
+
+  const bboxWidth = Math.max(1, component.maxX - component.minX + 1);
+  const bboxHeight = Math.max(1, component.maxY - component.minY + 1);
+  const leftSamples = [];
+  const rightSamples = [];
+  const topSamples = [];
+  const bottomSamples = [];
+
+  for (let y = component.minY; y <= component.maxY; y += 1) {
+    if (rowCount[y] < Math.max(5, bboxWidth * 0.12)) continue;
+    const span = rowMax[y] - rowMin[y];
+    if (span < bboxWidth * 0.22) continue;
+    leftSamples.push({ u: y, v: rowMin[y] });
+    rightSamples.push({ u: y, v: rowMax[y] });
+  }
+
+  for (let x = component.minX; x <= component.maxX; x += 1) {
+    if (colCount[x] < Math.max(5, bboxHeight * 0.12)) continue;
+    const span = colMax[x] - colMin[x];
+    if (span < bboxHeight * 0.22) continue;
+    topSamples.push({ u: x, v: colMin[x] });
+    bottomSamples.push({ u: x, v: colMax[x] });
+  }
+
+  const left = fitLine(leftSamples);
+  const right = fitLine(rightSamples);
+  const top = fitLine(topSamples);
+  const bottom = fitLine(bottomSamples);
+
+  let points = null;
+  if (left && right && top && bottom) {
+    points = [
+      intersectLeftRightWithTopBottom(left, top),
+      intersectLeftRightWithTopBottom(right, top),
+      intersectLeftRightWithTopBottom(right, bottom),
+      intersectLeftRightWithTopBottom(left, bottom),
+    ];
+  }
+
+  if (!pointsLookValid(points, width, height)) {
+    const sampled = component.points;
+    const extreme = {
+      tl: sampled.reduce((best, p) => (p.x + p.y < best.x + best.y ? p : best), sampled[0]),
+      tr: sampled.reduce((best, p) => ((width - p.x) + p.y < (width - best.x) + best.y ? p : best), sampled[0]),
+      br: sampled.reduce((best, p) => ((width - p.x) + (height - p.y) < (width - best.x) + (height - best.y) ? p : best), sampled[0]),
+      bl: sampled.reduce((best, p) => (p.x + (height - p.y) < best.x + (height - best.y) ? p : best), sampled[0]),
+    };
+    points = [extreme.tl, extreme.tr, extreme.br, extreme.bl];
+  }
+
+  if (!pointsLookValid(points, width, height)) return null;
+
+  return points.map((point) => clampPoint({ x: point.x / scale, y: point.y / scale }, width / scale, height / scale));
+}
+
 function detectDocumentPoints(img) {
-  const maxSide = 520;
+  const maxSide = 560;
   const scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
   const width = Math.max(1, Math.round(img.naturalWidth * scale));
   const height = Math.max(1, Math.round(img.naturalHeight * scale));
@@ -185,61 +393,70 @@ function detectDocumentPoints(img) {
   ctx.drawImage(img, 0, 0, width, height);
   const data = ctx.getImageData(0, 0, width, height).data;
 
-  const grays = [];
-  for (let i = 0; i < data.length; i += 16) {
-    grays.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+  const scores = [];
+  const grays = new Float32Array(width * height);
+  const sats = new Float32Array(width * height);
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+    const sat = max - min;
+    grays[p] = gray;
+    sats[p] = sat;
+    if (p % 3 === 0) scores.push(gray - sat * 0.48);
   }
 
-  const threshold = Math.max(142, percentile(grays, 0.68));
-  let minX = width;
-  let minY = height;
-  let maxX = 0;
-  let maxY = 0;
-  let count = 0;
+  const whiteScoreCut = Math.max(96, Math.min(202, percentile(scores, 0.60) - 4));
+  const mask = new Uint8Array(width * height);
+  for (let p = 0; p < grays.length; p += 1) {
+    const gray = grays[p];
+    const sat = sats[p];
+    const score = gray - sat * 0.48;
+    const paperLike = score >= whiteScoreCut || (gray > 128 && sat < 62) || (gray > 154 && sat < 94);
+    if (paperLike) mask[p] = 1;
+  }
 
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = (y * width + x) * 4;
-      const r = data[index];
-      const g = data[index + 1];
-      const b = data[index + 2];
-      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      const saturation = Math.max(r, g, b) - Math.min(r, g, b);
-      const isDocumentLike = gray >= threshold && (saturation < 95 || gray > 205);
-      if (!isDocumentLike) continue;
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
-      count += 1;
+  // 가는 글자와 그림자로 끊긴 부분을 살짝 메워 문서 한 장을 하나의 덩어리로 봅니다.
+  const closed = new Uint8Array(mask.length);
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      let hits = 0;
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          hits += mask[(y + dy) * width + (x + dx)];
+        }
+      }
+      if (hits >= 3) closed[y * width + x] = 1;
     }
   }
 
-  const area = (maxX - minX) * (maxY - minY);
+  const component = getLargestMaskComponent(closed, width, height);
+  if (!component) return null;
+
   const total = width * height;
-  if (count < total * 0.08 || area < total * 0.18) return null;
+  const bboxArea = (component.maxX - component.minX + 1) * (component.maxY - component.minY + 1);
+  if (component.count < total * 0.06 || bboxArea < total * 0.12) return null;
 
-  const padX = width * 0.025;
-  const padY = height * 0.025;
-  minX = Math.max(0, minX - padX);
-  minY = Math.max(0, minY - padY);
-  maxX = Math.min(width - 1, maxX + padX);
-  maxY = Math.min(height - 1, maxY + padY);
+  let points = componentToDocumentPoints(component, width, height, scale);
+  if (!points) return null;
 
-  const detectedWidth = maxX - minX;
-  const detectedHeight = maxY - minY;
-  if (detectedWidth < width * 0.32 || detectedHeight < height * 0.32) return null;
+  points = points.map((point) => clampPoint(point, img.naturalWidth, img.naturalHeight));
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const detectedWidth = Math.max(...xs) - Math.min(...xs);
+  const detectedHeight = Math.max(...ys) - Math.min(...ys);
 
-  return [
-    { x: minX / scale, y: minY / scale },
-    { x: maxX / scale, y: minY / scale },
-    { x: maxX / scale, y: maxY / scale },
-    { x: minX / scale, y: maxY / scale },
-  ];
+  // 카메라 사진 전체가 문서로 오인되면 손가락 조정이 쉬운 여백 추천으로 돌립니다.
+  if (detectedWidth > img.naturalWidth * 0.985 && detectedHeight > img.naturalHeight * 0.985) return null;
+
+  return points;
 }
 
 function suggestCropPoints(img) {
-  return detectDocumentPoints(img) || fullImagePoints(img);
+  return detectDocumentPoints(img) || safeInsetPoints(img);
 }
 
 function suggestCropPercent(img) {
@@ -491,20 +708,79 @@ function filterToCanvasFilter(filter) {
     case 'sharp': return 'brightness(1.05) contrast(1.22) saturate(0.95)';
     case 'bright': return 'brightness(1.18) contrast(1.05)';
     case 'contrast': return 'brightness(1.02) contrast(1.38)';
-    case 'bw': return 'grayscale(1) contrast(1.35) brightness(1.08)';
-    case 'dewrinkle': return 'grayscale(.15) brightness(1.16) contrast(1.25) saturate(.8)';
+    case 'bw': return 'grayscale(1) contrast(1.06) brightness(1.04)';
+    case 'dewrinkle': return 'grayscale(.10) brightness(1.10) contrast(1.12) saturate(.88)';
     default: return 'none';
   }
+}
+
+function boxBlurGray(gray, width, height, radius) {
+  const horizontal = new Float32Array(width * height);
+  const out = new Float32Array(width * height);
+  const windowSize = radius * 2 + 1;
+
+  for (let y = 0; y < height; y += 1) {
+    let sum = 0;
+    for (let x = -radius; x <= radius; x += 1) {
+      const cx = Math.max(0, Math.min(width - 1, x));
+      sum += gray[y * width + cx];
+    }
+    for (let x = 0; x < width; x += 1) {
+      horizontal[y * width + x] = sum / windowSize;
+      const removeX = Math.max(0, x - radius);
+      const addX = Math.min(width - 1, x + radius + 1);
+      sum += gray[y * width + addX] - gray[y * width + removeX];
+    }
+  }
+
+  for (let x = 0; x < width; x += 1) {
+    let sum = 0;
+    for (let y = -radius; y <= radius; y += 1) {
+      const cy = Math.max(0, Math.min(height - 1, y));
+      sum += horizontal[cy * width + x];
+    }
+    for (let y = 0; y < height; y += 1) {
+      out[y * width + x] = sum / windowSize;
+      const removeY = Math.max(0, y - radius);
+      const addY = Math.min(height - 1, y + radius + 1);
+      sum += horizontal[addY * width + x] - horizontal[removeY * width + x];
+    }
+  }
+
+  return out;
 }
 
 function applyBlackWhite(canvas) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = imageData.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    const value = gray > 165 ? 255 : 0;
-    data[i] = data[i + 1] = data[i + 2] = value;
+  const width = canvas.width;
+  const height = canvas.height;
+  const gray = new Float32Array(width * height);
+
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+
+  const radius = Math.max(8, Math.min(42, Math.round(Math.min(width, height) / 34)));
+  const background = boxBlurGray(gray, width, height, radius);
+
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    // 어두운 그림자 영역은 흰 배경으로 끌어올리고, 글자만 진하게 남깁니다.
+    const corrected = Math.max(0, Math.min(255, gray[p] + (238 - background[p]) * 0.92));
+    const localThreshold = Math.max(118, Math.min(178, background[p] - 34));
+    let value;
+
+    if (corrected < localThreshold) {
+      value = Math.max(0, corrected * 0.44);
+    } else if (corrected > 202) {
+      value = 255;
+    } else {
+      const t = (corrected - localThreshold) / Math.max(1, 202 - localThreshold);
+      value = 210 + t * 45;
+    }
+
+    data[i] = data[i + 1] = data[i + 2] = Math.max(0, Math.min(255, value));
   }
   ctx.putImageData(imageData, 0, 0);
 }
@@ -513,13 +789,24 @@ function applyDocumentClean(canvas) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = imageData.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    const normalized = gray < 120 ? gray * 0.82 : 255 - ((255 - gray) * 0.36);
-    const value = Math.max(0, Math.min(255, normalized));
-    data[i] = data[i] * 0.25 + value * 0.75;
-    data[i + 1] = data[i + 1] * 0.25 + value * 0.75;
-    data[i + 2] = data[i + 2] * 0.25 + value * 0.75;
+  const width = canvas.width;
+  const height = canvas.height;
+  const gray = new Float32Array(width * height);
+
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+
+  const radius = Math.max(10, Math.min(52, Math.round(Math.min(width, height) / 28)));
+  const background = boxBlurGray(gray, width, height, radius);
+
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    const corrected = Math.max(0, Math.min(255, gray[p] + (242 - background[p]) * 0.78));
+    const contrast = corrected < 135 ? corrected * 0.76 : 255 - (255 - corrected) * 0.44;
+    const value = Math.max(0, Math.min(255, contrast));
+    data[i] = data[i] * 0.18 + value * 0.82;
+    data[i + 1] = data[i + 1] * 0.18 + value * 0.82;
+    data[i + 2] = data[i + 2] * 0.18 + value * 0.82;
   }
   ctx.putImageData(imageData, 0, 0);
 }
